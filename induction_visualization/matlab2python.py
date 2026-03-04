@@ -20,7 +20,7 @@ def load_india_data(
     out = m["out"]
 
     # ----------------------------
-    # Convert every field in 'out' to numpy (best-effort)
+    # Convert every field in 'out' to numpy 
     # ----------------------------
     data = {}
     fieldnames = getattr(out, "_fieldnames", None)
@@ -41,7 +41,7 @@ def load_india_data(
             data[name] = val
 
     # ----------------------------
-    # Standardized convenience pulls (your named variables)
+    # Standardized convenience pulls
     # ----------------------------
     def _as_float_1d(x, nm):
         if x is None:
