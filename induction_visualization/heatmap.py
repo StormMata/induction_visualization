@@ -120,10 +120,13 @@ def binned_heatmap(
     alpha=1,
     textcolor="auto",
     textcolor_thresh=0.4,
-    text_fontsize=fontsize,
+    label_fontsize=1,
+    fontsize=fontsize,
     normalize_by=None,         
     normalize_mode="divide",   
-    normalize_tol=None,        
+    normalize_tol=None,
+    aspect_eq=True,
+
 ):
     # TeX-like serif digits without requiring external LaTeX
     mpl.rcParams["mathtext.fontset"] = "stix"
@@ -224,8 +227,9 @@ def binned_heatmap(
 
     ax.set_xticks(alpha_centers)
     ax.set_yticks(veer_centers)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+    ax.set_xlabel(xlabel, fontsize=fontsize)
+    ax.set_ylabel(ylabel, fontsize=fontsize)
+    ax.tick_params(axis='both', labelsize=fontsize)
 
     def auto_text_color(rgba, thresh=textcolor_thresh):
         r, g, b, _ = rgba
@@ -246,7 +250,7 @@ def binned_heatmap(
                     s = r"$\mathdefault{" + fmt.format(val) + "}$"
                     ax.text(a0, v0, s,
                             ha="center", va="center",
-                            fontsize=text_fontsize,
+                            fontsize=label_fontsize * fontsize,
                             color=tc)
 
     cbar = fig.colorbar(mesh, ax=ax, pad=0.02)
@@ -254,6 +258,9 @@ def binned_heatmap(
 
     ax.set_xlim(alpha_edges[0], alpha_edges[-1])
     ax.set_ylim(veer_edges[0], veer_edges[-1])
+
+    if aspect_eq:
+        ax.set_aspect('equal')
 
     fig.tight_layout()
     return fig, ax

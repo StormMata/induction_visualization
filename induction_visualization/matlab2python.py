@@ -101,6 +101,11 @@ def load_india_data(
         nCases=nCases,
     )
 
+    # NEW: optional pre-filter time-window averaging
+    data, filters = _apply_time_window_averaging(data, filters)
+    nCases = int(data["nCases"])
+    nH = int(data["nH"])
+
     # ----------------------------
     # Build mask from filters (ONLY if provided)
     # ----------------------------
@@ -169,3 +174,203 @@ def load_india_data(
 
     data["nCases_filtered"] = case_idx.size
     return data
+
+import numpy as np
+
+def _apply_time_window_averaging(
+    data: dict,
+    filters: dict | None,
+    *,
+    time_field: str = "time",
+    gap_factor: float = 5.0,
+):
+    """
+    Optional pre-filter averaging over contiguous time windows.
+
+    Expected special keys inside `filters`:
+        avg_window : int >= 1
+            Target number of timestamps per full averaging window.
+        window_min : int >= 1, optional
+            Minimum allowable size for a leftover partial window.
+            Defaults to avg_window, meaning only full windows are kept.
+
+    Behavior:
+    - If avg_window is missing or == 1, data is returned unchanged.
+    - Time gaps are detected from `data[time_field]` using the median positive
+      sampling interval. A new contiguous segment starts whenever:
+          dt <= 0, dt is non-finite, or dt > gap_factor * median_dt
+    - Within each contiguous segment of length N:
+          q, r = divmod(N, avg_window)
+      keep q full windows of length avg_window, and keep the remainder r only if
+      r >= window_min.
+
+    Notes:
+    - Assumes timestamps are already in dataset order.
+    - Numeric case-indexed arrays are averaged with nanmean.
+    - Non-numeric case-indexed arrays are reduced by taking the first value
+      in each window.
+    """
+
+    if not filters:
+        return data, filters
+
+    # Pull out the special windowing options, but leave the original dict untouched.
+    avg_window = filters.get("avg_window", None)
+    window_min = filters.get("window_min", None)
+
+    cleaned_filters = {
+        k: v for k, v in filters.items()
+        if k not in ("avg_window", "window_min")
+    }
+
+    # No windowing requested
+    if avg_window is None:
+        return data, cleaned_filters
+
+    # Validate avg_window
+    if not isinstance(avg_window, (int, np.integer)) or int(avg_window) < 1:
+        raise ValueError(f"'avg_window' must be an integer >= 1. Got {avg_window!r}.")
+    avg_window = int(avg_window)
+
+    if avg_window == 1:
+        return data, cleaned_filters
+
+    # Default window_min: only keep full windows unless user explicitly allows smaller remainder windows
+    if window_min is None:
+        window_min = avg_window
+
+    if not isinstance(window_min, (int, np.integer)) or int(window_min) < 1:
+        raise ValueError(f"'window_min' must be an integer >= 1. Got {window_min!r}.")
+    window_min = int(window_min)
+
+    if window_min > avg_window:
+        raise ValueError(
+            f"'window_min' must be <= 'avg_window'. Got window_min={window_min}, avg_window={avg_window}."
+        )
+
+    # Need time data
+    if time_field not in data:
+        raise KeyError(
+            f"Requested averaging by time, but '{time_field}' is not present in data."
+        )
+
+    time = np.asarray(data[time_field], dtype=float).reshape(-1)
+    nCases = int(data["nCases"])
+
+    if time.shape[0] != nCases:
+        raise ValueError(
+            f"'{time_field}' must be 1D with length nCases={nCases}. Got shape {time.shape}."
+        )
+
+    if nCases == 0:
+        raise ValueError("No cases available for time-window averaging.")
+
+    # --------------------------------
+    # Detect contiguous time segments
+    # --------------------------------
+    if nCases == 1:
+        segments = [(0, 1)]
+        median_dt = np.nan
+    else:
+        dt = np.diff(time)
+        pos_dt = dt[np.isfinite(dt) & (dt > 0)]
+
+        if pos_dt.size == 0:
+            # Fallback: treat every sample as its own segment if time is unusable
+            segments = [(i, i + 1) for i in range(nCases)]
+            median_dt = np.nan
+        else:
+            median_dt = float(np.median(pos_dt))
+
+            # Break when time is non-increasing, non-finite, or there is a large gap
+            breaks = (~np.isfinite(dt)) | (dt <= 0) | (dt > gap_factor * median_dt)
+
+            starts = np.r_[0, np.where(breaks)[0] + 1]
+            ends   = np.r_[np.where(breaks)[0] + 1, nCases]
+            segments = list(zip(starts, ends))
+
+    # --------------------------------
+    # Build windows
+    # --------------------------------
+    windows = []
+    dropped_tail_counts = []
+
+    for start, end in segments:
+        seg_len = end - start
+        if seg_len <= 0:
+            continue
+
+        q, r = divmod(seg_len, avg_window)
+
+        # Full windows of exact size avg_window
+        for j in range(q):
+            s = start + j * avg_window
+            e = s + avg_window
+            windows.append(np.arange(s, e, dtype=int))
+
+        # Optional remainder window
+        if r >= window_min:
+            s = start + q * avg_window
+            e = end
+            windows.append(np.arange(s, e, dtype=int))
+        elif r > 0:
+            dropped_tail_counts.append(r)
+
+    if len(windows) == 0:
+        raise ValueError(
+            "No averaging windows could be formed. "
+            f"Try reducing avg_window={avg_window} or window_min={window_min}."
+        )
+
+    # --------------------------------
+    # Aggregate case-indexed arrays
+    # --------------------------------
+    new_data = dict(data)  # shallow copy is fine; we replace arrays below
+    nH = int(data["nH"])
+
+    def _aggregate_1d(arr, idx_groups):
+        arr = np.asarray(arr)
+        if np.issubdtype(arr.dtype, np.number):
+            return np.array([np.nanmean(arr[idx]) for idx in idx_groups], dtype=float)
+        else:
+            return np.array([arr[idx[0]] for idx in idx_groups], dtype=arr.dtype)
+
+    def _aggregate_2d_profiles(arr, idx_groups):
+        arr = np.asarray(arr)
+        if np.issubdtype(arr.dtype, np.number):
+            return np.column_stack([np.nanmean(arr[:, idx], axis=1) for idx in idx_groups])
+        else:
+            return np.column_stack([arr[:, idx[0]] for idx in idx_groups])
+
+    for k, v in list(data.items()):
+        if not isinstance(v, np.ndarray):
+            continue
+
+        # 1D case-indexed arrays
+        if v.ndim == 1 and v.shape[0] == nCases:
+            new_data[k] = _aggregate_1d(v, windows)
+
+        # 2D profile arrays with cases along axis 1
+        elif v.ndim == 2 and v.shape == (nH, nCases):
+            new_data[k] = _aggregate_2d_profiles(v, windows)
+
+    # Update bookkeeping
+    new_nCases = len(windows)
+    new_data["nCases"] = new_nCases
+    new_data["avg_window_info"] = {
+        "applied": True,
+        "time_field": time_field,
+        "avg_window": avg_window,
+        "window_min": window_min,
+        "gap_factor": gap_factor,
+        "median_dt_days": median_dt,
+        "n_original_cases": nCases,
+        "n_segments": len(segments),
+        "n_windows": new_nCases,
+        "window_lengths": np.array([len(w) for w in windows], dtype=int),
+        "window_start_idx": np.array([w[0] for w in windows], dtype=int),
+        "window_end_idx": np.array([w[-1] for w in windows], dtype=int),
+        "dropped_tail_counts": np.array(dropped_tail_counts, dtype=int),
+    }
+
+    return new_data, cleaned_filters
