@@ -177,6 +177,7 @@ def binned_heatmap(
     normalize_mode="divide",
     normalize_tol=None,
     aspect_eq=True,
+    remove_normalize_bin=False,
 ):
     # TeX-like serif digits without requiring external LaTeX
     mpl.rcParams["mathtext.fontset"] = "stix"
@@ -226,6 +227,9 @@ def binned_heatmap(
         return idx
 
     Z_plot = Z.copy()
+    i_ref = None
+    j_ref = None
+
     if normalize_by is not None:
         a_ref, v_ref = normalize_by
         i_ref = _resolve_bin_index(a_ref, alpha_centers, "alpha")
@@ -275,6 +279,22 @@ def binned_heatmap(
         alpha=alpha,
     )
 
+    if remove_normalize_bin and (i_ref is not None) and (j_ref is not None):
+        xb0, xb1 = alpha_edges[i_ref], alpha_edges[i_ref + 1]
+        yb0, yb1 = veer_edges[j_ref], veer_edges[j_ref + 1]
+
+        ax.add_patch(
+            Rectangle(
+                (xb0, yb0),
+                xb1 - xb0,
+                yb1 - yb0,
+                facecolor="k",
+                edgecolor="none",
+                linewidth=max(1.5, 2 * linewidth),
+                zorder=10,
+            )
+        )
+
     ax.set_xticks(alpha_centers)
     ax.set_yticks(veer_centers)
     ax.set_xlabel(xlabel, fontsize=fontsize)
@@ -318,6 +338,9 @@ def binned_heatmap(
         ax.set_aspect("equal")
 
     fig.tight_layout()
+
+    print(f'Number of bins: {np.count_nonzero(~np.isnan(np.asarray(Z)))}')
+
     return fig, ax
 
 
