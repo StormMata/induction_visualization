@@ -13,7 +13,8 @@ requested filters.
 
 Design choices are explicit and configurable:
 - default lidar source: ``ZX_zxtm5052``;
-- SCADA power is interpreted as kW;
+- SCADA power ``ActPower_Value_mean`` is interpreted as kW;
+- all turbine scalar variables are extracted from explicit hard-coded SCADA columns with no fallback;
 - ``GenRpm_Value_mean`` is direct-drive rotor speed in rpm;
 - TSR is computed as ``(rpm * 2*pi/60) * R / U_hub``;
 - multiple yaw definitions are preserved as ``yaw_*`` arrays, and ``yaw_mode``
@@ -54,9 +55,17 @@ DEFAULT_RHO = 1.225            # [kg/m^3]
 DEFAULT_HUBR = np.nan
 DEFAULT_B = 3
 
-POWER_COL = "ActPower_Value_mean"
-NACELLE_HEADING_COL = "NacelPos_Value_mean"
-SCADA_WIND_DIR_COL = "AcWindDr_Value_mean"
+# Explicit SCADA column mapping requested for Ørsted A04.
+# These are intentionally hard-coded: if a column is absent, the loader raises
+# an error rather than falling back to another variable.
+POWER_COL = "ActPower_Value_mean"              # turbine power [kW]
+NACELLE_HEADING_COL = "NacelPos_Value_mean"    # turbine heading / nacelle position [deg]
+SCADA_WIND_DIR_COL = "AcWindDr_Value_mean"     # turbine hub wind direction, absolute [deg]
+TURBINE_HUB_SPEED_COL = "AcWindSp_AcWindSp_mean"  # turbine hub/nacelle wind speed [m/s]
+GENERATOR_RPM_COL = "GenRpm_Value_mean"          # direct-drive rotor/generator speed [rpm]
+PITCH_COL = "PitcPosA_Value_mean"                # pitch [deg]
+TURBINE_TI_COL = "TurbEst_TurbEst_mean"          # turbine TI, as provided (not percent)
+AMBIENT_TEMP_COL = "AmbieTmp_Value_mean"         # ambient temperature [deg C]
 
 DEFAULT_NBL_FILES = {
     "WindCube_WI01030180": {
@@ -215,6 +224,16 @@ def _series_or_default(df: pd.DataFrame, candidates: Sequence[str], default, n: 
             raise ValueError(f"Default array has length {arr.size}, expected {n}")
         return arr
     return pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
+
+def _require_columns(df: pd.DataFrame, columns: Sequence[str], source_name: str) -> None:
+    """Raise a clear error if any required hard-coded columns are absent."""
+    missing = [c for c in columns if c not in df.columns]
+    if missing:
+        raise KeyError(
+            f"Missing required {source_name} columns: {missing}. "
+            "orsted2python now uses explicit hard-coded Ørsted column names "
+            "and does not fall back to alternative variables."
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -882,38 +901,42 @@ def load_orsted_data(
     )
 
     scada_ref = pd.DataFrame(index=grid)
+
+    # Hard-coded SCADA extraction.  Do not fall back to substitute variables.
     if power_col is None:
         power_col = POWER_COL
-    if power_col not in scada_num.columns:
-        raise KeyError(f"Requested power column {power_col!r} was not found after SCADA numeric resampling.")
+    required_numeric_scada_cols = [
+        power_col,
+        TURBINE_HUB_SPEED_COL,
+        GENERATOR_RPM_COL,
+        PITCH_COL,
+        TURBINE_TI_COL,
+        AMBIENT_TEMP_COL,
+    ]
+    required_direction_scada_cols = [NACELLE_HEADING_COL, SCADA_WIND_DIR_COL]
+    _require_columns(scada_num, required_numeric_scada_cols, "SCADA numeric")
+    _require_columns(scada_dir_df, required_direction_scada_cols, "SCADA direction")
+
+    # User-specified meanings:
+    #   AcWindSp_AcWindSp_mean -> turbine hub speed
+    #   AcWindDr_Value_mean    -> turbine hub wind direction, absolute
+    #   GenRpm_Value_mean      -> direct-drive rotor/generator rpm
+    #   PitcPosA_Value_mean    -> pitch [deg]
+    #   TurbEst_TurbEst_mean   -> turbine TI, as provided (not percent)
+    #   AmbieTmp_Value_mean    -> temperature [C]
+    #   NacelPos_Value_mean    -> turbine/nacelle heading [deg]
+    #   ActPower_Value_mean    -> turbine power [kW]
     scada_ref["P_obs"] = scada_num[power_col]
     scada_ref["scada_power"] = scada_num[power_col]
+    scada_ref["turbine_hub_speed"] = scada_num[TURBINE_HUB_SPEED_COL]
+    scada_ref["turbine_hub_direction_deg"] = scada_dir_df[SCADA_WIND_DIR_COL]
+    scada_ref["generator_rpm"] = scada_num[GENERATOR_RPM_COL]
+    scada_ref["pitch_deg"] = scada_num[PITCH_COL]
+    scada_ref["turbine_TI"] = scada_num[TURBINE_TI_COL]
+    scada_ref["ambient_temp_c"] = scada_num[AMBIENT_TEMP_COL]
     scada_ref["nacelle_heading_deg"] = scada_dir_df[NACELLE_HEADING_COL]
     scada_ref["scada_wind_dir_deg"] = scada_dir_df[SCADA_WIND_DIR_COL]
     scada_ref["local_yaw_deg"] = wrap_180(scada_ref["scada_wind_dir_deg"] - scada_ref["nacelle_heading_deg"])
-
-    optional_scada_cols = {
-        "turbine_ok_mean": "TurbinOK_TurbinOK_mean",
-        "turbine_ok_min": "TurbinOK_TurbinOK_min",
-        "turbine_ok_max": "TurbinOK_TurbinOK_max",
-        "power_reduction_mean": "ActLimit_PowerRed_mean",
-        "power_reduction_min": "ActLimit_PowerRed_min",
-        "power_reduction_max": "ActLimit_PowerRed_max",
-        "pitch_deg": "PitcPosA_Value_mean",
-        "pitch_deg_min": "PitcPosA_Value_min",
-        "pitch_deg_max": "PitcPosA_Value_max",
-        "generator_rpm": "GenRpm_Value_mean",
-        "generator_rpm_min": "GenRpm_Value_min",
-        "generator_rpm_max": "GenRpm_Value_max",
-        "nacelle_wind_speed": "AcWindSp_AcWindSp_mean",
-        "nacelle_wind_speed_min": "AcWindSp_AcWindSp_min",
-        "nacelle_wind_speed_max": "AcWindSp_AcWindSp_max",
-        "turbine_est_wind_speed": "TurbEst_TurbEst_mean",
-        "ambient_temp": "AmbieTmp_Value_mean",
-    }
-    for new_name, old_name in optional_scada_cols.items():
-        if old_name in scada_num.columns:
-            scada_ref[new_name] = scada_num[old_name]
 
     # 4. Extract and resample ZX profiles from raw lidar.
     speed_cols = _select_zx_profile_columns(inventory, lidar_key, "speed", preferred_range_m=preferred_lidar_range_m, strict=True)
@@ -977,19 +1000,18 @@ def load_orsted_data(
     dsrate = pd.to_numeric(table[f"{lidar_key}_veer_rate_deg_per_m"], errors="coerce").to_numpy(dtype=float)
 
     power = pd.to_numeric(table["P_obs"], errors="coerce").to_numpy(dtype=float)  # kW
-    Thubspeed = _series_or_default(table, ["turbine_est_wind_speed", "nacelle_wind_speed"], hubspeed, n)
-    pitch_deg = _series_or_default(table, ["pitch_deg"], np.nan, n)
-    generator_rpm = _series_or_default(table, ["generator_rpm"], np.nan, n)
+    Thubspeed = pd.to_numeric(table["turbine_hub_speed"], errors="coerce").to_numpy(dtype=float)
+    pitch_deg = pd.to_numeric(table["pitch_deg"], errors="coerce").to_numpy(dtype=float)
+    generator_rpm = pd.to_numeric(table["generator_rpm"], errors="coerce").to_numpy(dtype=float)
     omega_rad_s = generator_rpm * 2.0 * np.pi / 60.0
     tsr = omega_rad_s * float(R) / hubspeed
 
-    ti_col = _choose_existing_column(table, [f"{lidar_key}_T_mean", f"{lidar_key}_TI_hub", "TI", "ti"], required=False)
-    if ti_col is not None:
-        ti = pd.to_numeric(table[ti_col], errors="coerce").to_numpy(dtype=float)
-    elif ti_profile is not None:
-        ti = _interpolate_profile_at_height(ti_profile, float(Hub)).reindex(table.index).to_numpy(dtype=float)
-    else:
-        ti = np.full(n, np.nan)
+    # Turbine TI is explicitly TurbEst_TurbEst_mean, as provided in the SCADA
+    # file.  It is not converted to percent and is not replaced by lidar TI.
+    ti = pd.to_numeric(table["turbine_TI"], errors="coerce").to_numpy(dtype=float)
+    ambient_temp_c = pd.to_numeric(table["ambient_temp_c"], errors="coerce").to_numpy(dtype=float)
+    turbine_hub_direction_deg = pd.to_numeric(table["turbine_hub_direction_deg"], errors="coerce").to_numpy(dtype=float)
+    nacelle_heading_deg = pd.to_numeric(table["nacelle_heading_deg"], errors="coerce").to_numpy(dtype=float)
 
     yaw_lidar_hub_deg = wrap_180(pd.to_numeric(table[f"{lidar_key}_rel_dir_hub_deg"], errors="coerce").to_numpy(dtype=float))
     yaw_lidar_centered_deg = pd.to_numeric(table[f"{lidar_key}_rel_dir_hub_centered_deg"], errors="coerce").to_numpy(dtype=float)
@@ -1035,6 +1057,10 @@ def load_orsted_data(
         "rho": rho_arr,
         "flag_indx": np.ones(n, dtype=float),
         "Thubspeed": Thubspeed,
+        "turbine_hub_speed": Thubspeed,
+        "turbine_hub_direction_deg": turbine_hub_direction_deg,
+        "nacelle_heading_deg": nacelle_heading_deg,
+        "ambient_temp_c": ambient_temp_c,
         "tsr": tsr,
         "ti": ti,
         "power": power,
