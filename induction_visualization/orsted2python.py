@@ -1008,7 +1008,7 @@ def load_orsted_data(
 
     # Turbine TI is explicitly TurbEst_TurbEst_mean, as provided in the SCADA
     # file.  It is not converted to percent and is not replaced by lidar TI.
-    ti = pd.to_numeric(table["turbine_TI"], errors="coerce").to_numpy(dtype=float)
+    ti = 100.0 * pd.to_numeric(table["turbine_TI"], errors="coerce").to_numpy(dtype=float)
     ambient_temp_c = pd.to_numeric(table["ambient_temp_c"], errors="coerce").to_numpy(dtype=float)
     turbine_hub_direction_deg = pd.to_numeric(table["turbine_hub_direction_deg"], errors="coerce").to_numpy(dtype=float)
     nacelle_heading_deg = pd.to_numeric(table["nacelle_heading_deg"], errors="coerce").to_numpy(dtype=float)
