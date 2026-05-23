@@ -16,8 +16,8 @@ Design choices are explicit and configurable:
 - SCADA power is interpreted as kW;
 - ``GenRpm_Value_mean`` is direct-drive rotor speed in rpm;
 - TSR is computed as ``(rpm * 2*pi/60) * R / U_hub``;
-- multiple yaw definitions are preserved, and ``yaw_mode`` chooses which one is
-  exposed as India-compatible ``hubdir``;
+- multiple yaw definitions are preserved as ``yaw_*`` arrays, and ``yaw_mode``
+  only chooses which one is exposed as India-compatible ``hubdir``;
 - for Ørsted, ``filters["avg_window"]`` is a *time window in minutes*.
   The requested averaging window must be no smaller than the coarsest native
   timestep among SCADA and the selected lidar source.  For 1-min SCADA and
@@ -1063,6 +1063,15 @@ def load_orsted_data(
         "yaw_scada_nacelle_deg": yaw_scada_nacelle_deg,
         "yaw_scada_centered_deg": yaw_scada_centered_deg,
         "yaw_lidar_minus_scada_deg": yaw_lidar_minus_scada_deg,
+
+        # Short yaw aliases so users can compare all definitions after one load.
+        # ``yaw_mode`` only controls which one is copied into ``hubdir``.
+        "yaw_lidar": yaw_lidar_hub_deg,
+        "yaw_lidar_centered": yaw_lidar_centered_deg,
+        "yaw_scada": yaw_scada_nacelle_deg,
+        "yaw_scada_centered": yaw_scada_centered_deg,
+        "yaw_lidar_minus_scada": yaw_lidar_minus_scada_deg,
+
         "nacelle_heading_deg": pd.to_numeric(table["nacelle_heading_deg"], errors="coerce").to_numpy(dtype=float),
         "scada_wind_dir_deg": pd.to_numeric(table["scada_wind_dir_deg"], errors="coerce").to_numpy(dtype=float),
         "source_index": table.index.astype(str).to_numpy(),
