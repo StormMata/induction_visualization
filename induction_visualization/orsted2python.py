@@ -55,7 +55,7 @@ DEFAULT_DIAMETER = 154.0       # [m]
 DEFAULT_R = DEFAULT_DIAMETER / 2.0
 DEFAULT_HUB = 103.3            # [m]
 DEFAULT_RHO = 1.225            # [kg/m^3]
-DEFAULT_HUBR = np.nan
+DEFAULT_HUBR = 0.0
 DEFAULT_B = 3
 
 # Explicit SCADA column mapping requested for Ørsted A04.
@@ -258,6 +258,47 @@ def _drop_rows_with_any_nan(df: pd.DataFrame, source_name: str) -> tuple[pd.Data
         f"n_{source_name}_rows_before_dropna": n_before,
         f"n_{source_name}_rows_after_dropna": n_after,
         f"n_{source_name}_rows_removed_dropna": int(n_before - n_after),
+    }
+    return clean, diag
+
+
+def _drop_rows_with_nan_in_columns(
+    df: pd.DataFrame,
+    columns: Sequence[str],
+    source_name: str,
+) -> tuple[pd.DataFrame, dict]:
+    """Drop rows containing NaN/Inf in required columns and return diagnostics.
+
+    Raw Ørsted files contain many auxiliary columns that are sparse by design.
+    Dropping rows based on every column in the raw file can remove essentially
+    the full dataset before the timestep can even be inferred.  This helper
+    applies the strict no-NaN rule to the columns used to construct the output
+    data structure. A final output-level cleanup later guarantees that returned
+    case-wise outputs contain no NaN/Inf values.
+    """
+    columns = list(dict.fromkeys(columns))
+    _require_columns(df, columns, source_name)
+
+    n_before = int(len(df))
+    tmp = df.replace([np.inf, -np.inf], np.nan)
+    valid = tmp[columns].notna().all(axis=1)
+    clean = df.loc[valid].copy()
+    n_after = int(len(clean))
+
+    if n_after < 2:
+        missing_counts = tmp[columns].isna().sum().sort_values(ascending=False)
+        raise ValueError(
+            f"Only {n_after} rows in {source_name} remained after dropping NaN/Inf "
+            "values in the required extraction columns. At least two rows are needed "
+            "to infer the native timestep. Missing counts by required column:\n"
+            + missing_counts.to_string()
+        )
+
+    diag = {
+        f"n_{source_name}_rows_before_required_dropna": n_before,
+        f"n_{source_name}_rows_after_required_dropna": n_after,
+        f"n_{source_name}_rows_removed_required_dropna": int(n_before - n_after),
+        f"{source_name}_dropna_required_columns": ",".join(columns),
     }
     return clean, diag
 
@@ -968,18 +1009,43 @@ def load_orsted_data(
         NACELLE_HEADING_COL,
         SCADA_WIND_DIR_COL,
     ]
-    _require_columns(scada, required_raw_scada_cols, "raw SCADA")
 
-    # Strict source-level cleaning requested by the user: drop any native SCADA
-    # row with NaN/Inf in any loaded SCADA column before averaging/resampling.
-    scada, scada_drop_diag = _drop_rows_with_any_nan(scada, "raw_scada")
+    # Drop native SCADA rows with NaN/Inf in the columns used to construct the
+    # output structure. Dropping against every auxiliary SCADA column is too
+    # strict for these files because many auxiliary channels are sparse.
+    scada, scada_drop_diag = _drop_rows_with_nan_in_columns(
+        scada,
+        required_raw_scada_cols,
+        "raw_scada_required",
+    )
 
     nbl_raw, inventory = _load_nbl_raw_files(nbl_dir, zx_nbl_dir, required_keys=[lidar_key])
     lidar_raw = nbl_raw[lidar_key]
 
-    # Strict source-level cleaning requested by the user: drop any native lidar
-    # row with NaN/Inf in any loaded lidar column before averaging/resampling.
-    lidar_raw, lidar_drop_diag = _drop_rows_with_any_nan(lidar_raw, "raw_lidar")
+    # Select the lidar profile columns first, then drop native lidar rows with
+    # NaN/Inf in exactly those columns. This preserves all rows needed for the
+    # chosen speed/direction/TI profiles while avoiding unrelated sparse lidar
+    # metadata columns.
+    speed_cols = _select_zx_profile_columns(
+        inventory, lidar_key, "speed", preferred_range_m=preferred_lidar_range_m, strict=True
+    )
+    dir_cols = _select_zx_profile_columns(
+        inventory, lidar_key, "direction", preferred_range_m=preferred_lidar_range_m, strict=True
+    )
+    ti_cols = _select_zx_profile_columns(
+        inventory, lidar_key, "ti", preferred_range_m=preferred_lidar_range_m, strict=False
+    )
+
+    required_lidar_cols = (
+        list(speed_cols["column"])
+        + list(dir_cols["column"])
+        + ([] if ti_cols.empty else list(ti_cols["column"]))
+    )
+    lidar_raw, lidar_drop_diag = _drop_rows_with_nan_in_columns(
+        lidar_raw,
+        required_lidar_cols,
+        "raw_lidar_required",
+    )
 
     # 2. Build common time grid directly from raw native timesteps.
     avg_window = filters.get("avg_window", None)
