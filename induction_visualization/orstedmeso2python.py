@@ -26,6 +26,9 @@ Default protocol
 - direction profile returned in ``dir_profiles`` is the hybrid relative
   direction profile: mesoscale direction anomaly about hub height anchored to
   lidar hub-height relative direction;
+- by default, hybrid speed, direction, and density profiles are linearly
+  extrapolated down to the rotor bottom ``Hub - R`` using the lowest available
+  mesoscale levels, so returned profiles span the lower rotor tip;
 - power is kW from ActPower_Value_mean;
 - turbine rotor speed is rpm from GenRpm_Value_mean;
 - turbine TI is read from TurbEst_TurbEst_mean and converted from fraction to
@@ -449,6 +452,81 @@ def _interpolate_profile_at_height(profile_df: pd.DataFrame, target_height: floa
     return pd.Series(out, index=profile_df.index)
 
 
+
+def _linear_extrapolate_profile_to_lower_bound(
+    profile_df: pd.DataFrame,
+    lower_height: float,
+    *,
+    n_fit_levels: int = 3,
+    angle_degrees: bool = False,
+) -> pd.DataFrame:
+    """Add a profile value at ``lower_height`` using local linear extrapolation.
+
+    The existing profile values are unchanged.  If ``lower_height`` is already
+    within the available vertical grid, the input profile is returned with sorted
+    numeric columns.  If ``lower_height`` is below the lowest available level,
+    the value at ``lower_height`` is computed independently for each timestamp
+    from a straight-line fit to the lowest ``n_fit_levels`` finite values.
+
+    For angular profiles, the fit is done to wrapped angular differences from
+    the lowest finite level, which avoids spurious jumps across the -180/180
+    boundary for relative-direction profiles.
+    """
+    if profile_df is None:
+        return None
+
+    out = profile_df.copy()
+    out.columns = np.asarray(out.columns, dtype=float)
+    out = out.reindex(sorted(out.columns), axis=1)
+
+    z_all = np.asarray(out.columns, dtype=float)
+    if len(z_all) == 0:
+        return out
+
+    lower_height = float(lower_height)
+
+    # If the requested lower bound is already covered by the grid, do not
+    # invent a new level.
+    if lower_height >= np.nanmin(z_all) or np.any(np.isclose(z_all, lower_height, rtol=0.0, atol=1e-9)):
+        return out
+
+    values = out.to_numpy(dtype=float)
+    y_lower = np.full(values.shape[0], np.nan)
+    n_fit_levels = max(int(n_fit_levels), 2)
+
+    for i, row in enumerate(values):
+        ok = np.isfinite(row) & np.isfinite(z_all)
+        if np.count_nonzero(ok) < 2:
+            continue
+
+        z = z_all[ok]
+        y = row[ok]
+        order = np.argsort(z)
+        z = z[order]
+        y = y[order]
+
+        k = min(n_fit_levels, len(z))
+        z_fit = z[:k]
+        y_fit = y[:k]
+
+        if angle_degrees:
+            # Anchor at the lowest finite angle and fit local wrapped angle
+            # anomalies relative to that anchor.
+            z0 = z_fit[0]
+            y0 = y_fit[0]
+            dy = wrap_180(y_fit - y0)
+            if k >= 2:
+                slope = np.polyfit(z_fit - z0, dy, deg=1)[0]
+                y_lower[i] = wrap_180(y0 + slope * (lower_height - z0))
+        else:
+            if k >= 2:
+                slope, intercept = np.polyfit(z_fit, y_fit, deg=1)
+                y_lower[i] = slope * lower_height + intercept
+
+    out[lower_height] = y_lower
+    out = out.reindex(sorted(out.columns), axis=1)
+    return out
+
 def _compute_power_law_shear_alpha(speed_profile: pd.DataFrame, hub_height: float, diameter: float) -> pd.Series:
     heights = np.asarray(speed_profile.columns, dtype=float)
     in_rotor = (heights >= hub_height - diameter / 2.0) & (heights <= hub_height + diameter / 2.0)
@@ -646,6 +724,8 @@ def load_orsted_meso_data(
     preferred_lidar_range_m: float | None = None,
     lidar_direction_is_already_relative: bool | None = None,
     center_yaw: bool = True,
+    extrapolate_to_rotor_bottom: bool = True,
+    extrapolate_n_levels: int = 3,
     return_intermediate: bool = False,
 ) -> dict:
     """Load Ørsted SCADA/lidar/mesoscale data and return India-style dict.
@@ -736,6 +816,32 @@ def load_orsted_meso_data(
     # Hybrid profiles.
     hybrid_speed = meso_shear_ratio.mul(U_lidar_HH_raw, axis=0)
     hybrid_rel_dir = pd.DataFrame(wrap_180(meso_dir_anom.add(lidar_rel_dir_hub, axis=0).to_numpy(dtype=float)), index=grid, columns=meso_dir_anom.columns)
+
+    # The mesoscale vertical grid may start above the lower rotor tip.  For
+    # REWS/REP integration over the full rotor, add a rotor-bottom level using
+    # local linear extrapolation from the lowest resolved mesoscale levels.
+    # Existing mesoscale levels are left unchanged.
+    rotor_bottom = float(Hub) - float(R)
+    if extrapolate_to_rotor_bottom:
+        hybrid_speed = _linear_extrapolate_profile_to_lower_bound(
+            hybrid_speed,
+            rotor_bottom,
+            n_fit_levels=extrapolate_n_levels,
+            angle_degrees=False,
+        )
+        hybrid_rel_dir = _linear_extrapolate_profile_to_lower_bound(
+            hybrid_rel_dir,
+            rotor_bottom,
+            n_fit_levels=extrapolate_n_levels,
+            angle_degrees=True,
+        )
+        meso_density = _linear_extrapolate_profile_to_lower_bound(
+            meso_density,
+            rotor_bottom,
+            n_fit_levels=extrapolate_n_levels,
+            angle_degrees=False,
+        )
+
     hybrid_U_hub = _interpolate_profile_at_height(hybrid_speed, Hub)
     hybrid_rel_dir_hub = wrap_180(_interpolate_profile_at_height(hybrid_rel_dir, Hub))
     hybrid_alpha = _compute_power_law_shear_alpha(hybrid_speed, Hub, diameter)
@@ -785,7 +891,12 @@ def load_orsted_meso_data(
     heights = np.asarray(hybrid_speed.columns, dtype=float)
     speed = hybrid_speed.to_numpy(dtype=float).T
     dir_rel = hybrid_rel_dir.to_numpy(dtype=float).T
-    ti_prof_arr = lidar_ti.to_numpy(dtype=float).T if lidar_ti is not None else np.full_like(speed, np.nan)
+    if lidar_ti is not None:
+        # Keep ti_profiles aligned with the returned height grid.  The added
+        # rotor-bottom mesoscale level does not have a direct lidar TI value.
+        ti_prof_arr = lidar_ti.reindex(columns=hybrid_speed.columns).to_numpy(dtype=float).T
+    else:
+        ti_prof_arr = np.full_like(speed, np.nan)
 
     power = pd.to_numeric(table["P_obs"], errors="coerce").to_numpy(dtype=float)
     hubspeed = pd.to_numeric(table["hybrid_U_hub"], errors="coerce").to_numpy(dtype=float)
@@ -858,6 +969,10 @@ def load_orsted_meso_data(
 
         # Mesoscale/hybrid diagnostics.
         "profile_source": "hybrid_lidar_scaled_mesoscale",
+        "profile_extrapolated_to_rotor_bottom": bool(extrapolate_to_rotor_bottom),
+        "profile_extrapolation_method": "linear_lowest_levels" if extrapolate_to_rotor_bottom else "none",
+        "profile_extrapolation_n_levels": int(max(int(extrapolate_n_levels), 2)),
+        "profile_extrapolation_lower_height": float(Hub) - float(R),
         "hybrid_REWS": pd.to_numeric(table["hybrid_REWS"], errors="coerce").to_numpy(dtype=float),
         "hybrid_U_hub": hubspeed,
         "hybrid_V": pd.to_numeric(table["hybrid_V"], errors="coerce").to_numpy(dtype=float),
