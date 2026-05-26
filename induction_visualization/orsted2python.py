@@ -15,6 +15,9 @@ Design choices are explicit and configurable:
 - default lidar source: ``ZX_zxtm5052``;
 - SCADA power ``ActPower_Value_mean`` is interpreted as kW;
 - all turbine scalar variables are extracted from explicit hard-coded SCADA columns with no fallback;
+- raw SCADA rows with any missing value are removed before resampling;
+- raw lidar rows with any missing value are removed before resampling;
+- final case-wise outputs are strictly filtered to remove any remaining NaN/Inf values;
 - ``GenRpm_Value_mean`` is direct-drive rotor speed in rpm;
 - TSR is computed as ``(rpm * 2*pi/60) * R / U_hub``;
 - multiple yaw definitions are preserved as ``yaw_*`` arrays, and ``yaw_mode``
@@ -234,6 +237,74 @@ def _require_columns(df: pd.DataFrame, columns: Sequence[str], source_name: str)
             "orsted2python now uses explicit hard-coded Ørsted column names "
             "and does not fall back to alternative variables."
         )
+
+
+def _drop_rows_with_any_nan(df: pd.DataFrame, source_name: str) -> tuple[pd.DataFrame, dict]:
+    """Drop rows containing NaN/Inf in any column and return diagnostics.
+
+    This is intentionally strict. It is used before any averaging/resampling so
+    every native sample contributing to the unified dataset is complete across
+    the loaded source table.
+    """
+    n_before = int(len(df))
+    clean = df.replace([np.inf, -np.inf], np.nan).dropna(axis=0, how="any").copy()
+    n_after = int(len(clean))
+    if n_after == 0:
+        raise ValueError(
+            f"All rows in {source_name} were removed by strict dropna(axis=0, how='any'). "
+            "At least one column is missing for every native row."
+        )
+    diag = {
+        f"n_{source_name}_rows_before_dropna": n_before,
+        f"n_{source_name}_rows_after_dropna": n_after,
+        f"n_{source_name}_rows_removed_dropna": int(n_before - n_after),
+    }
+    return clean, diag
+
+
+def _finite_case_mask(data: Mapping) -> np.ndarray:
+    """Return mask keeping only cases with finite numeric case/profile values.
+
+    Scalars, metadata arrays, strings, empty arrays, and arrays not aligned with
+    the case dimension are ignored. Numeric 1D arrays of length nCases and 2D
+    profile arrays with case dimension nCases are enforced.
+    """
+    n = int(data["nCases"])
+    mask = np.ones(n, dtype=bool)
+    for key, val in data.items():
+        if key in {"nCases", "nH"} or str(key).startswith("_"):
+            continue
+        arr = np.asarray(val)
+        if arr.dtype.kind not in "biufc":
+            continue
+        if arr.ndim == 1 and arr.size == n:
+            mask &= np.isfinite(arr.astype(float))
+        elif arr.ndim == 2 and arr.shape[1] == n:
+            mask &= np.all(np.isfinite(arr.astype(float)), axis=0)
+    return mask
+
+
+def _assert_no_case_nans(data: Mapping) -> None:
+    """Raise if any case-wise numeric output still contains NaN/Inf."""
+    n = int(data["nCases"])
+    bad = []
+    for key, val in data.items():
+        if key in {"nCases", "nH"} or str(key).startswith("_"):
+            continue
+        arr = np.asarray(val)
+        if arr.dtype.kind not in "biufc":
+            continue
+        if arr.ndim == 1 and arr.size == n:
+            if not np.all(np.isfinite(arr.astype(float))):
+                bad.append(key)
+        elif arr.ndim == 2 and arr.shape[1] == n:
+            if not np.all(np.isfinite(arr.astype(float))):
+                bad.append(key)
+        elif arr.ndim == 0 and arr.dtype.kind in "biufc":
+            if not np.isfinite(float(arr)):
+                bad.append(key)
+    if bad:
+        raise ValueError(f"NaN/Inf values remain in output fields: {bad}")
 
 
 # -----------------------------------------------------------------------------
@@ -884,20 +955,31 @@ def load_orsted_data(
     # 1. Load raw sources.
     scada = _load_scada_parquet_dir(scada_dir, turbine_id=turbine_id)
 
-    # Require nacelle heading column to exist.
-    # NacelPos_Value_mean is sparse and behaves like a state variable.
-    # We therefore do not delete raw rows before native time-step inference;
-    # instead we resample first and then remove windows where heading is still unavailable.
-    _require_columns(scada, [NACELLE_HEADING_COL], "raw SCADA")
+    # Require hard-coded SCADA columns to exist before cleaning.
+    if power_col is None:
+        power_col = POWER_COL
+    required_raw_scada_cols = [
+        power_col,
+        TURBINE_HUB_SPEED_COL,
+        GENERATOR_RPM_COL,
+        PITCH_COL,
+        TURBINE_TI_COL,
+        AMBIENT_TEMP_COL,
+        NACELLE_HEADING_COL,
+        SCADA_WIND_DIR_COL,
+    ]
+    _require_columns(scada, required_raw_scada_cols, "raw SCADA")
 
-    n_raw_scada_total = int(len(scada))
-    n_raw_scada_heading_finite = int(
-        pd.to_numeric(scada[NACELLE_HEADING_COL], errors="coerce").notna().sum()
-    )
-    n_raw_scada_heading_nan = int(n_raw_scada_total - n_raw_scada_heading_finite)
+    # Strict source-level cleaning requested by the user: drop any native SCADA
+    # row with NaN/Inf in any loaded SCADA column before averaging/resampling.
+    scada, scada_drop_diag = _drop_rows_with_any_nan(scada, "raw_scada")
 
     nbl_raw, inventory = _load_nbl_raw_files(nbl_dir, zx_nbl_dir, required_keys=[lidar_key])
     lidar_raw = nbl_raw[lidar_key]
+
+    # Strict source-level cleaning requested by the user: drop any native lidar
+    # row with NaN/Inf in any loaded lidar column before averaging/resampling.
+    lidar_raw, lidar_drop_diag = _drop_rows_with_any_nan(lidar_raw, "raw_lidar")
 
     # 2. Build common time grid directly from raw native timesteps.
     avg_window = filters.get("avg_window", None)
@@ -913,36 +995,45 @@ def load_orsted_data(
         already_relative=False,
     )
 
-    # Drop resampled windows where nacelle heading is unavailable.
-    # This strict filter guarantees data["nacelle_heading_deg"] is finite after loading.
-    valid_heading_window = pd.to_numeric(
-        scada_dir_df[NACELLE_HEADING_COL],
-        errors="coerce",
-    ).notna()
+    # Drop resampled windows where any required SCADA output column is unavailable.
+    # The raw sources were already cleaned, but empty target windows can still
+    # appear after reindexing to the common grid.
+    required_numeric_scada_cols = [
+        power_col,
+        TURBINE_HUB_SPEED_COL,
+        GENERATOR_RPM_COL,
+        PITCH_COL,
+        TURBINE_TI_COL,
+        AMBIENT_TEMP_COL,
+    ]
+    required_direction_scada_cols = [NACELLE_HEADING_COL, SCADA_WIND_DIR_COL]
 
-    n_resampled_windows_before_heading_filter = int(len(scada_dir_df))
+    n_resampled_windows_before_scada_complete_filter = int(len(scada_num))
+    valid_scada_window = np.ones(len(scada_num), dtype=bool)
+    for col in required_numeric_scada_cols:
+        valid_scada_window &= pd.to_numeric(scada_num[col], errors="coerce").notna().to_numpy()
+    for col in required_direction_scada_cols:
+        valid_scada_window &= pd.to_numeric(scada_dir_df[col], errors="coerce").notna().to_numpy()
 
-    scada_num = scada_num.loc[valid_heading_window].copy()
-    scada_dir_df = scada_dir_df.loc[valid_heading_window].copy()
+    scada_num = scada_num.loc[valid_scada_window].copy()
+    scada_dir_df = scada_dir_df.loc[valid_scada_window].copy()
     grid = scada_dir_df.index
 
-    n_resampled_windows_after_heading_filter = int(len(scada_dir_df))
-    n_resampled_windows_removed_missing_heading = int(
-        n_resampled_windows_before_heading_filter
-        - n_resampled_windows_after_heading_filter
+    n_resampled_windows_after_scada_complete_filter = int(len(scada_dir_df))
+    n_resampled_windows_removed_incomplete_scada = int(
+        n_resampled_windows_before_scada_complete_filter
+        - n_resampled_windows_after_scada_complete_filter
     )
 
-    if n_resampled_windows_after_heading_filter == 0:
+    if n_resampled_windows_after_scada_complete_filter == 0:
         raise ValueError(
-            f"All resampled windows were removed because {NACELLE_HEADING_COL!r} "
-            "is NaN after resampling."
+            "All resampled windows were removed because at least one required "
+            "SCADA column is NaN after resampling."
         )
 
     scada_ref = pd.DataFrame(index=grid)
 
     # Hard-coded SCADA extraction.  Do not fall back to substitute variables.
-    if power_col is None:
-        power_col = POWER_COL
     required_numeric_scada_cols = [
         power_col,
         TURBINE_HUB_SPEED_COL,
@@ -1075,13 +1166,18 @@ def load_orsted_data(
 
     speed = speed_profile.reindex(table.index).to_numpy(dtype=float).T
     dir_rel = rel_dir_profile.reindex(table.index).to_numpy(dtype=float).T
-    ti_prof_arr = ti_profile.reindex(table.index).to_numpy(dtype=float).T if ti_profile is not None else np.full_like(speed, np.nan)
+    if ti_profile is not None:
+        ti_prof_arr = ti_profile.reindex(table.index).to_numpy(dtype=float).T
+    else:
+        # Keep the output NaN-free even when no lidar TI profile exists by
+        # repeating the finite SCADA turbine TI at every profile height.
+        ti_prof_arr = np.tile(ti.reshape(1, -1), (len(heights), 1))
 
     data = {
         "turbine_name": turbine_name,
         "R": float(R),
         "Hub": float(Hub),
-        "HubR": float(HubR) if np.isfinite(HubR) else np.nan,
+        "HubR": float(HubR) if np.isfinite(HubR) else 0.0,
         "B": int(B),
         "heights": heights.astype(float),
         "speed": speed,
@@ -1141,13 +1237,12 @@ def load_orsted_data(
         "scada_wind_dir_deg": pd.to_numeric(table["scada_wind_dir_deg"], errors="coerce").to_numpy(dtype=float),
         "source_index": table.index.astype(str).to_numpy(),
 
-        # Heading availability diagnostics
-        "n_raw_scada_total": int(n_raw_scada_total),
-        "n_raw_scada_heading_finite": int(n_raw_scada_heading_finite),
-        "n_raw_scada_heading_nan": int(n_raw_scada_heading_nan),
-        "n_resampled_windows_before_heading_filter": int(n_resampled_windows_before_heading_filter),
-        "n_resampled_windows_after_heading_filter": int(n_resampled_windows_after_heading_filter),
-        "n_resampled_windows_removed_missing_heading": int(n_resampled_windows_removed_missing_heading),
+        # Strict source-cleaning diagnostics
+        **scada_drop_diag,
+        **lidar_drop_diag,
+        "n_resampled_windows_before_scada_complete_filter": int(n_resampled_windows_before_scada_complete_filter),
+        "n_resampled_windows_after_scada_complete_filter": int(n_resampled_windows_after_scada_complete_filter),
+        "n_resampled_windows_removed_incomplete_scada": int(n_resampled_windows_removed_incomplete_scada),
 
         # Resampling diagnostics
         "resample_native_scada_dt_seconds": float(time_diag["scada_native_dt"].total_seconds()),
@@ -1159,17 +1254,38 @@ def load_orsted_data(
     mask = _case_mask(data, filters)
     data = _apply_case_mask(data, mask)
 
-    # 8. Derived CP, using power [kW] and Paero [kW].
-    try:
-        p_aero_kw = 0.5 * np.asarray(data["rho"]) * np.pi * float(R) ** 2 * np.asarray(data["hubspeed"]) ** 3 * 1e-3
-        data["turbine_CP"] = np.asarray(data["power"]) / p_aero_kw
-    except Exception:
-        data["turbine_CP"] = np.full(int(data["nCases"]), np.nan)
+    # 8. Strict final output cleaning. This drops any case with NaN/Inf in any
+    # numeric case-wise output or any profile value before deriving CP.
+    n_before_output_complete_filter = int(data["nCases"])
+    complete_mask = _finite_case_mask(data)
+    data = _apply_case_mask(data, complete_mask)
+    n_after_output_complete_filter = int(data["nCases"])
+    data["n_cases_before_output_complete_filter"] = int(n_before_output_complete_filter)
+    data["n_cases_after_output_complete_filter"] = int(n_after_output_complete_filter)
+    data["n_cases_removed_incomplete_output"] = int(
+        n_before_output_complete_filter - n_after_output_complete_filter
+    )
+
+    if int(data["nCases"]) == 0:
+        raise ValueError(
+            "All cases were removed by final NaN/Inf output cleaning. "
+            "The requested strict no-NaN requirement is too restrictive for these inputs."
+        )
+
+    # 9. Derived CP, using power [kW] and Paero [kW].
+    p_aero_kw = 0.5 * np.asarray(data["rho"]) * np.pi * float(R) ** 2 * np.asarray(data["hubspeed"]) ** 3 * 1e-3
+    data["turbine_CP"] = np.asarray(data["power"]) / p_aero_kw
+
+    # Enforce no remaining NaN/Inf in case-wise outputs after CP is added.
+    cp_complete_mask = _finite_case_mask(data)
+    if not np.all(cp_complete_mask):
+        data = _apply_case_mask(data, cp_complete_mask)
+    _assert_no_case_nans(data)
 
     if return_intermediate:
         data["_intermediate"] = {
-            "scada_raw": scada,
-            "lidar_raw": lidar_raw,
+            "scada_raw_clean": scada,
+            "lidar_raw_clean": lidar_raw,
             "inventory": inventory,
             "table_before_filter": table,
             "speed_profile": speed_profile,
