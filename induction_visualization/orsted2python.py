@@ -64,7 +64,7 @@ SCADA_WIND_DIR_COL = "AcWindDr_Value_mean"     # turbine hub wind direction, abs
 TURBINE_HUB_SPEED_COL = "AcWindSp_AcWindSp_mean"  # turbine hub/nacelle wind speed [m/s]
 GENERATOR_RPM_COL = "GenRpm_Value_mean"          # direct-drive rotor/generator speed [rpm]
 PITCH_COL = "PitcPosA_Value_mean"                # pitch [deg]
-TURBINE_TI_COL = "TurbEst_TurbEst_mean"          # turbine TI, as provided (not percent)
+TURBINE_TI_COL = "TurbEst_TurbEst_mean"          # turbine TI, fractional raw value; converted to percent
 AMBIENT_TEMP_COL = "AmbieTmp_Value_mean"         # ambient temperature [deg C]
 
 DEFAULT_NBL_FILES = {
@@ -881,27 +881,20 @@ def load_orsted_data(
     if lidar_direction_is_already_relative is None:
         lidar_direction_is_already_relative = DEFAULT_LIDAR_DIRECTION_IS_ALREADY_RELATIVE.get(lidar_key, True)
 
-    # # 1. Load raw sources.
-    # scada = _load_scada_parquet_dir(scada_dir, turbine_id=turbine_id)
-    # nbl_raw, inventory = _load_nbl_raw_files(nbl_dir, zx_nbl_dir, required_keys=[lidar_key])
-    # lidar_raw = nbl_raw[lidar_key]
-
     # 1. Load raw sources.
     scada = _load_scada_parquet_dir(scada_dir, turbine_id=turbine_id)
 
-    # Require nacelle heading to be present before any resampling/averaging.
-    # This removes native SCADA rows where the sparse heading signal was not updated.
+    # Require nacelle heading column to exist.
+    # NacelPos_Value_mean is sparse and behaves like a state variable.
+    # We therefore do not delete raw rows before native time-step inference;
+    # instead we resample first and then remove windows where heading is still unavailable.
     _require_columns(scada, [NACELLE_HEADING_COL], "raw SCADA")
 
-    n_before_heading_filter = len(scada)
-    heading_valid = pd.to_numeric(scada[NACELLE_HEADING_COL], errors="coerce").notna()
-    scada = scada.loc[heading_valid].copy()
-    n_after_heading_filter = len(scada)
-
-    if n_after_heading_filter == 0:
-        raise ValueError(
-            f"All raw SCADA rows were removed because {NACELLE_HEADING_COL!r} is NaN."
-        )
+    n_raw_scada_total = int(len(scada))
+    n_raw_scada_heading_finite = int(
+        pd.to_numeric(scada[NACELLE_HEADING_COL], errors="coerce").notna().sum()
+    )
+    n_raw_scada_heading_nan = int(n_raw_scada_total - n_raw_scada_heading_finite)
 
     nbl_raw, inventory = _load_nbl_raw_files(nbl_dir, zx_nbl_dir, required_keys=[lidar_key])
     lidar_raw = nbl_raw[lidar_key]
@@ -919,6 +912,31 @@ def load_orsted_data(
         freq=target_dt,
         already_relative=False,
     )
+
+    # Drop resampled windows where nacelle heading is unavailable.
+    # This strict filter guarantees data["nacelle_heading_deg"] is finite after loading.
+    valid_heading_window = pd.to_numeric(
+        scada_dir_df[NACELLE_HEADING_COL],
+        errors="coerce",
+    ).notna()
+
+    n_resampled_windows_before_heading_filter = int(len(scada_dir_df))
+
+    scada_num = scada_num.loc[valid_heading_window].copy()
+    scada_dir_df = scada_dir_df.loc[valid_heading_window].copy()
+    grid = scada_dir_df.index
+
+    n_resampled_windows_after_heading_filter = int(len(scada_dir_df))
+    n_resampled_windows_removed_missing_heading = int(
+        n_resampled_windows_before_heading_filter
+        - n_resampled_windows_after_heading_filter
+    )
+
+    if n_resampled_windows_after_heading_filter == 0:
+        raise ValueError(
+            f"All resampled windows were removed because {NACELLE_HEADING_COL!r} "
+            "is NaN after resampling."
+        )
 
     scada_ref = pd.DataFrame(index=grid)
 
@@ -942,7 +960,7 @@ def load_orsted_data(
     #   AcWindDr_Value_mean    -> turbine hub wind direction, absolute
     #   GenRpm_Value_mean      -> direct-drive rotor/generator rpm
     #   PitcPosA_Value_mean    -> pitch [deg]
-    #   TurbEst_TurbEst_mean   -> turbine TI, as provided (not percent)
+    #   TurbEst_TurbEst_mean   -> turbine TI, fractional raw value converted to percent
     #   AmbieTmp_Value_mean    -> temperature [C]
     #   NacelPos_Value_mean    -> turbine/nacelle heading [deg]
     #   ActPower_Value_mean    -> turbine power [kW]
@@ -1026,8 +1044,9 @@ def load_orsted_data(
     omega_rad_s = generator_rpm * 2.0 * np.pi / 60.0
     tsr = omega_rad_s * float(R) / hubspeed
 
-    # Turbine TI is explicitly TurbEst_TurbEst_mean, as provided in the SCADA
-    # file.  It is not converted to percent and is not replaced by lidar TI.
+    # Turbine TI is explicitly TurbEst_TurbEst_mean from SCADA.
+    # Ørsted stores this as a fraction, e.g. 0.05 = 5%.
+    # Convert to percent to match the India dataset convention.
     ti = 100.0 * pd.to_numeric(table["turbine_TI"], errors="coerce").to_numpy(dtype=float)
     ambient_temp_c = pd.to_numeric(table["ambient_temp_c"], errors="coerce").to_numpy(dtype=float)
     turbine_hub_direction_deg = pd.to_numeric(table["turbine_hub_direction_deg"], errors="coerce").to_numpy(dtype=float)
@@ -1121,6 +1140,16 @@ def load_orsted_data(
         "nacelle_heading_deg": pd.to_numeric(table["nacelle_heading_deg"], errors="coerce").to_numpy(dtype=float),
         "scada_wind_dir_deg": pd.to_numeric(table["scada_wind_dir_deg"], errors="coerce").to_numpy(dtype=float),
         "source_index": table.index.astype(str).to_numpy(),
+
+        # Heading availability diagnostics
+        "n_raw_scada_total": int(n_raw_scada_total),
+        "n_raw_scada_heading_finite": int(n_raw_scada_heading_finite),
+        "n_raw_scada_heading_nan": int(n_raw_scada_heading_nan),
+        "n_resampled_windows_before_heading_filter": int(n_resampled_windows_before_heading_filter),
+        "n_resampled_windows_after_heading_filter": int(n_resampled_windows_after_heading_filter),
+        "n_resampled_windows_removed_missing_heading": int(n_resampled_windows_removed_missing_heading),
+
+        # Resampling diagnostics
         "resample_native_scada_dt_seconds": float(time_diag["scada_native_dt"].total_seconds()),
         "resample_native_lidar_dt_seconds": float(time_diag["lidar_native_dt"].total_seconds()),
         "resample_target_dt_seconds": float(time_diag["target_dt"].total_seconds()),
