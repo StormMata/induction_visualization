@@ -881,8 +881,28 @@ def load_orsted_data(
     if lidar_direction_is_already_relative is None:
         lidar_direction_is_already_relative = DEFAULT_LIDAR_DIRECTION_IS_ALREADY_RELATIVE.get(lidar_key, True)
 
+    # # 1. Load raw sources.
+    # scada = _load_scada_parquet_dir(scada_dir, turbine_id=turbine_id)
+    # nbl_raw, inventory = _load_nbl_raw_files(nbl_dir, zx_nbl_dir, required_keys=[lidar_key])
+    # lidar_raw = nbl_raw[lidar_key]
+
     # 1. Load raw sources.
     scada = _load_scada_parquet_dir(scada_dir, turbine_id=turbine_id)
+
+    # Require nacelle heading to be present before any resampling/averaging.
+    # This removes native SCADA rows where the sparse heading signal was not updated.
+    _require_columns(scada, [NACELLE_HEADING_COL], "raw SCADA")
+
+    n_before_heading_filter = len(scada)
+    heading_valid = pd.to_numeric(scada[NACELLE_HEADING_COL], errors="coerce").notna()
+    scada = scada.loc[heading_valid].copy()
+    n_after_heading_filter = len(scada)
+
+    if n_after_heading_filter == 0:
+        raise ValueError(
+            f"All raw SCADA rows were removed because {NACELLE_HEADING_COL!r} is NaN."
+        )
+
     nbl_raw, inventory = _load_nbl_raw_files(nbl_dir, zx_nbl_dir, required_keys=[lidar_key])
     lidar_raw = nbl_raw[lidar_key]
 
