@@ -1124,7 +1124,7 @@ def load_orsted_data(
     scada_ref["P_obs"] = scada_num[power_col]
     scada_ref["scada_power"] = scada_num[power_col]
     scada_ref["turbine_hub_speed"] = scada_num[TURBINE_HUB_SPEED_COL]
-    scada_ref["turbine_hub_direction_deg"] = scada_dir_df[SCADA_WIND_DIR_COL]
+    scada_ref["turbine_hub_direction_deg"] = scada_num[SCADA_WIND_DIR_COL]
     scada_ref["generator_rpm"] = scada_num[GENERATOR_RPM_COL]
     scada_ref["pitch_deg"] = scada_num[PITCH_COL]
     scada_ref["turbine_TI"] = scada_num[TURBINE_TI_COL]
