@@ -347,6 +347,154 @@ def _assert_no_case_nans(data: Mapping) -> None:
     if bad:
         raise ValueError(f"NaN/Inf values remain in output fields: {bad}")
 
+def _add_rotor_equivalent_speeds(
+    data: dict,
+    *,
+    n_r: int = 50,
+    n_theta: int = 120,
+    use_annulus_area: bool = True,
+):
+    """
+    Add rotor-equivalent speed fields to an India-style data dictionary.
+
+    Both U_REWS and U_REP use the rotor-normal velocity component:
+
+        U_n = U cos(gamma)
+
+    Definitions:
+
+        U_REWS = (1/A) ∫∫ U_n r dθ dr
+
+        U_REP = [(1/A) ∫∫ U_n^3 r dθ dr]^(1/3)
+
+    Required fields:
+        heights
+        speed or speed_profiles
+        dir_rel or dir_profiles
+        Hub or hubheight
+        R
+
+    Optional:
+        HubR
+    """
+
+    heights = np.asarray(data["heights"], dtype=float).reshape(-1)
+
+    if "speed_profiles" in data:
+        speed_profiles = np.asarray(data["speed_profiles"], dtype=float)
+    else:
+        speed_profiles = np.asarray(data["speed"], dtype=float)
+
+    if "dir_rel" in data:
+        dir_profiles = np.asarray(data["dir_rel"], dtype=float)
+    elif "dir_profiles" in data:
+        dir_profiles = np.asarray(data["dir_profiles"], dtype=float)
+    else:
+        raise KeyError("Need either data['dir_rel'] or data['dir_profiles'].")
+
+    R = float(np.asarray(data["R"], dtype=float).reshape(-1)[0])
+
+    if "hubheight" in data:
+        hubheight = float(np.asarray(data["hubheight"], dtype=float).reshape(-1)[0])
+    else:
+        hubheight = float(np.asarray(data["Hub"], dtype=float).reshape(-1)[0])
+
+    if "HubR" in data:
+        r_min = float(np.asarray(data["HubR"], dtype=float).reshape(-1)[0])
+    else:
+        r_min = 0.0
+
+    if r_min < 0:
+        raise ValueError(f"HubR/r_min must be nonnegative. Got {r_min}.")
+
+    if r_min >= R:
+        raise ValueError(
+            f"HubR/r_min must be smaller than R. Got r_min={r_min}, R={R}."
+        )
+
+    nH, nCases = speed_profiles.shape
+
+    if dir_profiles.shape != (nH, nCases):
+        raise ValueError(
+            f"dir_profiles shape {dir_profiles.shape} does not match "
+            f"speed_profiles shape {speed_profiles.shape}"
+        )
+
+    if heights.shape[0] != nH:
+        raise ValueError(
+            f"heights length {heights.shape[0]} does not match "
+            f"profile height dimension {nH}"
+        )
+
+    # Sort profiles by height before interpolation
+    order = np.argsort(heights)
+    h = heights[order]
+    spd = speed_profiles[order, :]
+    dire = dir_profiles[order, :]
+
+    # Rotor disk grid
+    r = np.linspace(r_min, R, n_r)
+    theta = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
+    dtheta = 2.0 * np.pi / n_theta
+
+    # z(theta, r) = z_hub + r cos(theta)
+    z_loc = hubheight + np.cos(theta)[:, None] * r[None, :]
+    flat_z = z_loc.ravel()
+
+    if use_annulus_area:
+        area = np.pi * (R**2 - r_min**2)
+    else:
+        area = np.pi * R**2
+
+    U_REWS = np.full(nCases, np.nan, dtype=float)
+    U_REP = np.full(nCases, np.nan, dtype=float)
+
+    for k in range(nCases):
+        # Interpolate local wind speed and relative direction to rotor grid
+        U_k = np.interp(flat_z, h, spd[:, k]).reshape(z_loc.shape)
+
+        gamma_k = np.deg2rad(
+            np.interp(flat_z, h, dire[:, k])
+        ).reshape(z_loc.shape)
+
+        # Rotor-normal velocity component
+        U_normal_k = U_k * np.cos(gamma_k)
+
+        # U_REWS: area average of rotor-normal velocity
+        azimuthal_integral_rews = dtheta * np.sum(U_normal_k, axis=0)
+        radial_integral_rews = np.trapezoid(
+            r * azimuthal_integral_rews,
+            x=r,
+        )
+        U_REWS[k] = radial_integral_rews / area
+
+        # U_REP: cube-root of area average of rotor-normal velocity cubed
+        azimuthal_integral_rep = dtheta * np.sum(U_normal_k**3, axis=0)
+        radial_integral_rep = np.trapezoid(
+            r * azimuthal_integral_rep,
+            x=r,
+        )
+        U_REP[k] = (radial_integral_rep / area) ** (1.0 / 3.0)
+
+    data["U_REWS"] = U_REWS
+    data["U_REP"] = U_REP
+
+    data["rotor_equivalent_info"] = {
+        "n_r": int(n_r),
+        "n_theta": int(n_theta),
+        "r_min": float(r_min),
+        "R": float(R),
+        "hubheight": float(hubheight),
+        "area": float(area),
+        "use_annulus_area": bool(use_annulus_area),
+        "definitions": {
+            "U_normal": "U cos(gamma)",
+            "U_REWS": "(1/A) integral U_normal dA",
+            "U_REP": "[(1/A) integral U_normal^3 dA]^(1/3)",
+        },
+    }
+
+    return data
 
 # -----------------------------------------------------------------------------
 # Raw file discovery and loading
@@ -1231,6 +1379,7 @@ def load_orsted_data(
         raise ValueError(f"rho array length {rho_arr.size} does not match number of cases {n}")
 
     speed = speed_profile.reindex(table.index).to_numpy(dtype=float).T
+    direction = dir_profile.reindex(table.index).to_numpy(dtype=float).T
     dir_rel = rel_dir_profile.reindex(table.index).to_numpy(dtype=float).T
     if ti_profile is not None:
         ti_prof_arr = ti_profile.reindex(table.index).to_numpy(dtype=float).T
@@ -1272,6 +1421,7 @@ def load_orsted_data(
         # Aliases expected by downstream Python workflows
         "speed_profiles": speed,
         "dir_profiles": dir_rel,
+        # "dir_profiles": direction,
         "ti_profiles": ti_prof_arr,
         "veer_deg_per_m": dsrate,
         "tsr_data": tsr,
@@ -1316,7 +1466,17 @@ def load_orsted_data(
         "resample_target_dt_seconds": float(time_diag["target_dt"].total_seconds()),
     }
 
-    # 7. Apply filters after unified structure is assembled.
+    # 7. Compute rotor-equivalent speeds before filtering.
+    # This makes U_REWS and U_REP available for filters such as:
+    #     {"U_REP_min": 6.0, "U_REP_max": 8.0}
+    data = _add_rotor_equivalent_speeds(
+        data,
+        n_r=50,
+        n_theta=120,
+        use_annulus_area=True,
+    )
+
+    # 8. Apply filters after unified structure is assembled.
     mask = _case_mask(data, filters)
     data = _apply_case_mask(data, mask)
 

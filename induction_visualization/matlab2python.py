@@ -55,7 +55,12 @@ def load_india_data(
 
     heights         = _as_float_1d(getattr(out, "heights", None), "heights")
     speed_profiles  = _as_float_nd(getattr(out, "speed", None),   "speed")
-    dir_profiles    = _as_float_nd(getattr(out, "dir_rel", None), "dir_rel")
+    direction = getattr(out, "direction", None)
+
+    if direction is not None:
+        dir_profiles = _as_float_nd(direction, "direction")
+    else:
+        dir_profiles = _as_float_nd(getattr(out, "dir_rel", None), "dir_rel")
 
     pitch_deg       = _as_float_1d(getattr(out, "pitch_deg", None), "pitch_deg")
     alpha_data      = _as_float_1d(getattr(out, "alpha", None),     "alpha")
@@ -105,6 +110,15 @@ def load_india_data(
     data, filters = _apply_time_window_averaging(data, filters)
     nCases = int(data["nCases"])
     nH = int(data["nH"])
+
+    # NEW: compute rotor-equivalent speeds before filtering
+
+    data = _add_rotor_equivalent_speeds(
+        data,
+        n_r=50,
+        n_theta=120,
+        use_annulus_area=True,
+    )
 
     # ----------------------------
     # Build mask from filters (ONLY if provided)
@@ -174,8 +188,6 @@ def load_india_data(
 
     data["nCases_filtered"] = case_idx.size
     return data
-
-import numpy as np
 
 def _apply_time_window_averaging(
     data: dict,
@@ -374,3 +386,144 @@ def _apply_time_window_averaging(
     }
 
     return new_data, cleaned_filters
+
+def _add_rotor_equivalent_speeds(
+    data: dict,
+    *,
+    n_r: int = 50,
+    n_theta: int = 120,
+    use_annulus_area: bool = True,
+):
+    """
+    Add rotor-equivalent speed fields to data.
+
+    Both quantities use the rotor-normal velocity component:
+
+        U_n = U cos(gamma)
+
+    Definitions used here:
+
+        U_REWS = (1/A) ∫∫ U_n r dθ dr
+
+        U_REP  = [(1/A) ∫∫ U_n^3 r dθ dr]^(1/3)
+
+    Required fields:
+        heights
+        speed or speed_profiles
+        dir_rel or dir_profiles
+        Hub or hubheight
+        R
+
+    Optional:
+        HubR : inner/root radius. If missing, r_min = 0.
+    """
+
+    heights = np.asarray(data["heights"], dtype=float).reshape(-1)
+
+    speed_profiles = np.asarray(
+        data["speed_profiles"],
+        dtype=float,
+    )
+
+    dir_profiles = np.asarray(
+        data["dir_rel"],
+        dtype=float,
+    )
+
+    R = float(np.asarray(data["R"], dtype=float).reshape(-1)[0])
+
+    hubheight = float(
+        np.asarray(
+            data["hubheight"] if "hubheight" in data else data["Hub"],
+            dtype=float,
+        ).reshape(-1)[0]
+    )
+
+    if "HubR" in data:
+        r_min = float(np.asarray(data["HubR"], dtype=float).reshape(-1)[0])
+    else:
+        r_min = 0.0
+
+    if r_min < 0:
+        raise ValueError(f"HubR/r_min must be nonnegative. Got {r_min}.")
+
+    if r_min >= R:
+        raise ValueError(f"HubR/r_min must be smaller than R. Got r_min={r_min}, R={R}.")
+
+    nH, nCases = speed_profiles.shape
+
+    if dir_profiles.shape != (nH, nCases):
+        raise ValueError(
+            f"dir_profiles shape {dir_profiles.shape} does not match "
+            f"speed_profiles shape {speed_profiles.shape}"
+        )
+
+    if heights.shape[0] != nH:
+        raise ValueError(
+            f"heights length {heights.shape[0]} does not match "
+            f"profile height dimension {nH}"
+        )
+
+    # Sort profiles by height before interpolation
+    order = np.argsort(heights)
+    h = heights[order]
+    spd = speed_profiles[order, :]
+    dire = dir_profiles[order, :]
+
+    # Rotor disk grid
+    r = np.linspace(r_min, R, n_r)
+    theta = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
+    dtheta = 2.0 * np.pi / n_theta
+
+    # z(theta, r) = z_hub + r cos(theta)
+    z_loc = hubheight + np.cos(theta)[:, None] * r[None, :]
+    flat_z = z_loc.ravel()
+
+    if use_annulus_area:
+        area = np.pi * (R**2 - r_min**2)
+    else:
+        area = np.pi * R**2
+
+    U_REWS = np.full(nCases, np.nan, dtype=float)
+    U_REP = np.full(nCases, np.nan, dtype=float)
+
+    for k in range(nCases):
+        # Interpolate speed and local relative direction onto rotor disk
+        U_k = np.interp(flat_z, h, spd[:, k]).reshape(z_loc.shape)
+
+        gamma_k = np.deg2rad(
+            np.interp(flat_z, h, dire[:, k])
+        ).reshape(z_loc.shape)
+
+        # Rotor-normal velocity component
+        U_normal_k = U_k * np.cos(gamma_k)
+
+        # REWS: area average of U_normal
+        theta_int_rews = dtheta * np.sum(U_normal_k, axis=0)
+        radial_int_rews = np.trapezoid(r * theta_int_rews, x=r)
+        U_REWS[k] = radial_int_rews / area
+
+        # REP: cube mean of U_normal
+        theta_int_rep = dtheta * np.sum(U_normal_k**3, axis=0)
+        radial_int_rep = np.trapezoid(r * theta_int_rep, x=r)
+        U_REP[k] = (radial_int_rep / area) ** (1.0 / 3.0)
+
+    data["U_REWS"] = U_REWS
+    data["U_REP"] = U_REP
+
+    data["rotor_equivalent_info"] = {
+        "n_r": n_r,
+        "n_theta": n_theta,
+        "r_min": r_min,
+        "R": R,
+        "hubheight": hubheight,
+        "area": area,
+        "use_annulus_area": use_annulus_area,
+        "definitions": {
+            "U_REWS": "(1/A) integral U_normal dA",
+            "U_REP": "[(1/A) integral U_normal^3 dA]^(1/3)",
+            "U_normal": "U cos(gamma)",
+        },
+    }
+
+    return data

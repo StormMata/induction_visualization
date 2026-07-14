@@ -698,6 +698,170 @@ def _apply_case_mask(data: dict, mask: np.ndarray) -> dict:
     out["nH"] = int(data["nH"])
     return out
 
+def _interp_power_curve(U, Pcurve_U, Pcurve_P):
+    """
+    Interpolate turbine power curve.
+
+    U        : wind speed array [m/s]
+    Pcurve_U : power-curve wind speeds [m/s]
+    Pcurve_P : power-curve power values [kW]
+
+    Returns power in kW.
+    """
+    U = np.asarray(U, dtype=float)
+    Pcurve_U = np.asarray(Pcurve_U, dtype=float)
+    Pcurve_P = np.asarray(Pcurve_P, dtype=float)
+
+    valid = np.isfinite(Pcurve_U) & np.isfinite(Pcurve_P)
+
+    if valid.sum() < 2:
+        return np.full_like(U, np.nan, dtype=float)
+
+    order = np.argsort(Pcurve_U[valid])
+
+    return np.interp(
+        U,
+        Pcurve_U[valid][order],
+        Pcurve_P[valid][order],
+        left=np.nan,
+        right=np.nan,
+    )
+
+
+def _add_aep_power_model_fields_from_existing_meso(
+    data: dict,
+    *,
+    pcurve_u=None,
+    pcurve_p=None,
+):
+    """
+    Add the AEP-analysis fields expected by the downstream workflow.
+
+    Adds:
+        P_hh_model
+        P_REWS
+        P_REWS_veer
+        veer
+        veer_top_bottom_deg
+
+    Uses existing mesoscale-loader fields:
+        hubspeed
+        hybrid_REWS, if available
+        dsrate
+        R
+        Pcurve_U / Pcurve_P
+
+    Notes
+    -----
+    P_hh_model:
+        power-curve prediction from hub-height wind speed.
+
+    P_REWS:
+        power-curve prediction from rotor-equivalent wind speed.
+
+    P_REWS_veer:
+        veer-adjusted REWS model using a simple projected-speed correction:
+
+            U_REWS_veer = U_REWS * cos(veer/2)
+
+        where veer is the top-bottom rotor veer in radians.
+
+    This is intentionally a simple AEP-style diagnostic, not the full REP
+    correction model.
+    """
+
+    out = data
+
+    # ------------------------------------------------------------
+    # Power curve
+    # ------------------------------------------------------------
+    if pcurve_u is None:
+        pcurve_u = out.get("Pcurve_U", np.asarray([]))
+
+    if pcurve_p is None:
+        pcurve_p = out.get("Pcurve_P", np.asarray([]))
+
+    pcurve_u = np.asarray(pcurve_u, dtype=float)
+    pcurve_p = np.asarray(pcurve_p, dtype=float)
+
+    # ------------------------------------------------------------
+    # Basic quantities
+    # ------------------------------------------------------------
+    R = float(np.asarray(out["R"], dtype=float).reshape(-1)[0])
+    diameter = 2.0 * R
+
+    U_hh = np.asarray(out["hubspeed"], dtype=float)
+
+    # Prefer the existing mesoscale hybrid_REWS if present.
+    # Otherwise use U_REWS if you have added it elsewhere.
+    if "hybrid_REWS" in out:
+        U_rews = np.asarray(out["hybrid_REWS"], dtype=float)
+    elif "U_REWS" in out:
+        U_rews = np.asarray(out["U_REWS"], dtype=float)
+    else:
+        raise KeyError(
+            "Need either data['hybrid_REWS'] or data['U_REWS'] "
+            "to compute P_REWS."
+        )
+
+    # ------------------------------------------------------------
+    # Top-bottom veer
+    # ------------------------------------------------------------
+    # Best option: if you expose top-bottom veer-rate explicitly.
+    if "hybrid_veer_top_bottom_deg_per_m" in out:
+        veer_deg = np.asarray(out["hybrid_veer_top_bottom_deg_per_m"], dtype=float) * diameter
+
+    # Current mesoscale data dictionary usually has dsrate as interval/rotor-layer veer rate.
+    # This is not exactly top-bottom veer if dsrate is interval-mean, but it is a usable
+    # fallback for plotting and filtering.
+    elif "dsrate" in out:
+        veer_deg = np.asarray(out["dsrate"], dtype=float) * diameter
+
+    elif "veer_deg_per_m" in out:
+        veer_deg = np.asarray(out["veer_deg_per_m"], dtype=float) * diameter
+
+    else:
+        veer_deg = np.full_like(U_hh, np.nan, dtype=float)
+
+    out["veer"] = veer_deg
+    out["veer_top_bottom_deg"] = veer_deg
+
+    # ------------------------------------------------------------
+    # Power predictions
+    # ------------------------------------------------------------
+    out["P_hh_model"] = _interp_power_curve(
+        U_hh,
+        pcurve_u,
+        pcurve_p,
+    )
+
+    out["P_REWS"] = _interp_power_curve(
+        U_rews,
+        pcurve_u,
+        pcurve_p,
+    )
+
+    # Simple veer-adjusted projected speed.
+    # Using half-veer is a compact approximation for symmetric top-bottom turning.
+    veer_rad = np.deg2rad(veer_deg)
+    U_rews_veer = U_rews * np.cos(0.5 * veer_rad)
+
+    out["U_REWS_veer"] = U_rews_veer
+
+    out["P_REWS_veer"] = _interp_power_curve(
+        U_rews_veer,
+        pcurve_u,
+        pcurve_p,
+    )
+
+    out["aep_power_model_info"] = {
+        "P_hh_model": "Power curve evaluated at hubspeed",
+        "P_REWS": "Power curve evaluated at existing mesoscale hybrid_REWS or U_REWS",
+        "P_REWS_veer": "Power curve evaluated at U_REWS*cos(veer/2)",
+        "veer": "Top-bottom rotor veer in degrees, or dsrate*2R fallback",
+    }
+
+    return out
 
 # -----------------------------------------------------------------------------
 # Public loader
@@ -1004,11 +1168,33 @@ def load_orsted_meso_data(
         "resample_target_dt_seconds": float(time_diag["target_dt"].total_seconds()),
     }
 
+    # Add AEP-style model fields before filtering.
+    # This makes P_hh_model, P_REWS, P_REWS_veer, and veer available downstream.
+    data = _add_aep_power_model_fields_from_existing_meso(
+        data,
+        pcurve_u=pcurve_u,
+        pcurve_p=pcurve_p,
+    )
+
+    # Add AEP-style model fields before filtering.
+    data = _add_aep_power_model_fields_from_existing_meso(
+        data,
+        pcurve_u=pcurve_u,
+        pcurve_p=pcurve_p,
+    )
+
     mask = _case_mask(data, filters)
     data = _apply_case_mask(data, mask)
 
     try:
-        p_aero_kw = 0.5 * np.asarray(data["rho"]) * np.pi * float(R) ** 2 * np.asarray(data["hubspeed"]) ** 3 * 1e-3
+        p_aero_kw = (
+            0.5
+            * np.asarray(data["rho"])
+            * np.pi
+            * float(R) ** 2
+            * np.asarray(data["hubspeed"]) ** 3
+            * 1e-3
+        )
         data["turbine_CP"] = np.asarray(data["power"]) / p_aero_kw
     except Exception:
         data["turbine_CP"] = np.full(int(data["nCases"]), np.nan)
